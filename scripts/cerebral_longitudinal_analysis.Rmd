@@ -1,0 +1,384 @@
+---
+title: "Longitudinal Analysis of Cognitive Age (ITTHACA)"
+author: "Iñigo Tellaetxe Elorriaga"
+date: "`r Sys.Date()`"
+output: 
+  html_document:
+  toc: true
+toc_float: true
+knit: (
+  function(inputFile, encoding) { 
+    rmarkdown::render('cerebral_longitudinal_analysis.Rmd',
+                      output_file = './rendered_R_notebooks/cerebral_longitudinal_analysis.html')
+  })
+---
+  Load libraries
+
+```{r}
+# Clear workspace
+rm(list = ls(all.names = TRUE))
+
+# Load libraries
+library(ggplot2); library(dplyr); library(sjPlot);library(metafor); library(ggpubr); library(tools); library(readxl); library(purrr); library(ggstatsplot)
+
+knitr::opts_chunk$set(echo = FALSE, message = FALSE, warning = FALSE)
+theme_set(theme_bw())
+
+graph_th <- theme(
+  text = element_text(family = "Times New Roman", size = 12),
+  axis.text = element_text(family = "Times New Roman", size = 12),
+  axis.title = element_text(family = "Times New Roman", size = 12),
+  strip.text = element_text(family = "Times New Roman", size = 8),
+  plot.margin = unit(c(0.2, 0.2, 0.2, 0.2), "cm"),
+  axis.title.y = element_text(margin = margin(r = 2, unit = "mm")),
+  axis.title.x = element_text(margin = margin(t = 2, unit = "mm"))
+)
+```
+
+
+Load data and merge
+```{r}
+deltas_path <- "../analyses/longitudinal/cerebral_longitudinal/ageml/model_age/predicted_age.csv"
+
+# Load deltas
+deltas <- read.csv(deltas_path) %>%
+  rename(delta = delta_all) %>%
+  rename(X = id)
+
+deltas <- deltas[c("X", "delta")]
+
+# Load features
+features_path <- "../data_for_ageml/longitudinal_data/cerebral_longitudinal/longitudinal_cerebral_features_with_record_id_SVH.csv"
+features <- read.csv(features_path, stringsAsFactors=F, colClasses="character")
+
+# Load the clinical file
+clinical_path <- "../data_for_ageml/longitudinal_data/cerebral_longitudinal/longitudinal_clinical_file.csv"
+clinical <- read.csv(clinical_path)
+
+# Merge the three dataframes
+deltas <- deltas %>%
+  merge(features, by="X") %>%
+  merge(clinical, by="X")
+
+# Filter by only the record_id_SVHs that appear twice
+deltas_filtered <- deltas %>%
+  group_by(record_id_SVH) %>%
+  filter(n() == 2)
+
+# In deltas, make a column "group" taking the values of "CN", "CN_NonIntervened" and "CN_Intervened" based on those three columns when they are equal to 1
+deltas_filtered <- deltas_filtered %>%
+  mutate(group = case_when(
+    CN == 1 ~ "CN",
+    CN_NonIntervened == 1 ~ "CN_NonIntervened",
+    CN_Intervened == 1 ~ "CN_Intervened"
+  )) %>%
+  # Also add a column named "timepoint" that equals 0 for "CN" in group, and 24 for the rest of values in the group column
+  mutate(timepoint = case_when(
+    group == "CN" ~ "t_0m",
+    group == "CN_NonIntervened" ~ "t_12m",
+    group == "CN_Intervened" ~ "t_12m"
+  ))
+# Make group and timepoint factors, and relevel them properly
+deltas_filtered$group <- as.factor(deltas_filtered$group)
+deltas_filtered$group <- relevel(deltas_filtered$group, ref="CN_NonIntervened")
+
+deltas_filtered$timepoint <- as.factor(deltas_filtered$timepoint)
+deltas_filtered$timepoint <- relevel(deltas_filtered$timepoint, ref="t_0m")
+```
+
+
+```{r}
+table(deltas_filtered$group)
+```
+
+
+```{r}
+# In deltas_filtered, for each "record_id_SVH", I want to assign it the group of the second timepoint
+deltas_filtered <- deltas_filtered %>%
+  group_by(record_id_SVH) %>%
+  mutate(group = last(group)) %>%
+  ungroup()
+deltas_filtered$group <- relevel(deltas_filtered$group, ref="CN_NonIntervened")
+```
+
+```{r}
+unique(deltas_filtered$group)
+```
+
+# Test progressions
+Test the progression of the groups.
+We use a Mixed-Model for Repeated Measures (MMRM) of this shape:
+  $$y_{ij} = \beta_0 + \beta_1 * group + \beta_2 * timepoint + \beta_3 * group * timepoint + b_i + \epsilon_{ij}$$
+  - Group: Intervention of Non-Intervention, fixed effect
+- Timepoint: Either t=0 months or t=12 months, fixed effect
+- $b_i$: Inter subject variability, random effect
+- $\epsilon_{ij}$: Intra subject variability, random effect
+
+We want to test the interaction term $\beta_3$, where $H_1: \mu_{\beta_3} \neq 0$
+
+```{r}
+library(lme4)
+library(lmerTest)
+
+model <- lmer(delta ~ group + timepoint + group:timepoint + (1 | record_id_SVH), data = deltas_filtered)
+print(summary(model))
+```
+
+
+```{r}
+qqnorm(resid(model))
+qqline(resid(model))
+```
+
+
+```{r}
+library(emmeans)
+
+# Assuming you have your model already fitted:
+# model <- lmer(delta ~ group + timepoint + group:timepoint + (1 | record_id_SVH), 
+#               data = deltas_filtered)
+
+# =============================================================================
+# 1. VISUALIZE THE RESULTS
+# =============================================================================
+
+# Extract predicted values from the model
+deltas_filtered$predicted <- predict(model)
+
+# Plot 1: Spaghetti plot with trajectories
+p1 <- ggplot(deltas_filtered, aes(x = timepoint, y = delta, group = record_id_SVH)) +
+  geom_line(aes(color = group), alpha = 0.3) +
+  geom_point(aes(color = group), alpha = 0.3) +
+  # Add model predictions (population average)
+  stat_summary(aes(group = group, color = group), 
+               fun = mean, geom = "line", size = 1) +
+  stat_summary(aes(group = group, color = group), 
+               fun = mean, geom = "point", size = 5) +
+  theme_minimal() +
+  labs(title = "Individual Trajectories with Group Means",
+       subtitle = "Thick lines = group averages",
+       x = "Timepoint",
+       y = "Delta",
+       color = "Group") +
+  theme(legend.position = "bottom")
+
+print(p1)
+
+# Plot 1: Spaghetti plot with model predictions
+p2 <- ggplot(deltas_filtered, aes(x = timepoint, y = predicted, group = record_id_SVH)) +
+  geom_line(aes(color = group), alpha = 0.3) +
+  geom_point(aes(color = group), alpha = 0.3) +
+  # Add model predictions (population average)
+  stat_summary(aes(group = group, color = group), 
+               fun = mean, geom = "line", size = 1) +
+  stat_summary(aes(group = group, color = group), 
+               fun = mean, geom = "point", size = 5) +
+  theme_minimal() +
+  labs(title = "Individual Trajectories with Group Means (Predictions)",
+       subtitle = "Thick lines = group averages",
+       x = "Timepoint",
+       y = "Delta",
+       color = "Group") +
+  theme(legend.position = "bottom")
+
+print(p2)
+```
+
+```{r}
+# Plot 2: Box plots by group and timepoint
+p3 <- ggplot(deltas_filtered, aes(x = timepoint, y = delta, fill = group)) +
+  geom_boxplot(alpha = 0.7) +
+  geom_jitter(width = 0.1, alpha = 0.2) +
+  theme_minimal() +
+  labs(title = "Distribution of Delta by Group and Timepoint",
+       x = "Timepoint",
+       y = "Delta",
+       fill = "Group") +
+  theme(legend.position = "bottom")
+
+print(p3)
+```
+
+```{r}
+# Plot 3: Interaction plot with confidence intervals
+my_95CI <- function(data){mean_se(data, mult = 1.96)}
+
+p4 <- ggplot(deltas_filtered, aes(x = timepoint, y = delta, color = group, group = group)) +
+  stat_summary(fun = mean, geom = "line", size = 1.2) +
+  stat_summary(fun = mean, geom = "point", size = 3) +
+  stat_summary(fun.data = my_95CI, geom = "errorbar", width = 0.1, size = 1) +
+  theme_minimal() +
+  labs(title = "Group Means with 95% Confidence Interval",
+       subtitle = "",
+       x = "Timepoint",
+       y = "CAD",
+       color = "Group") +
+  theme(legend.position = "bottom")
+
+print(p4)
+ggsave(filename="CAD_longitudinal_trajectories.svg", plot=p4, width=6, height=4)
+```
+
+```{r}
+# 1. Calculate the raw difference (Change)
+library(tidyr)
+plot_data <- deltas_filtered %>%
+  filter(timepoint %in% c("t_0m", "t_12m")) %>%
+  select(record_id_SVH, group, timepoint, delta) %>%
+  pivot_wider(names_from = timepoint, values_from = delta) %>%
+  mutate(abs_change = t_12m - t_0m) %>% # Just the subtraction
+  filter(!is.na(abs_change))
+
+# 2. Plot the Mean Change
+plot_mean_change <- ggplot(plot_data, aes(x = group, y = abs_change, fill = group)) +
+  stat_summary(fun = mean, geom = "bar", width = 0.6) +
+  theme_minimal() +
+  labs(
+    title = "Mean Change in Cognitive Age Delta (t_12m - t_0m)",
+    x = "Group",
+    y = "Mean Change"
+  ) +
+  theme(legend.position = "none")
+
+print(plot_mean_change)
+ggsave(filename="CAD_mean_abs_change.svg", plot=plot_mean_change, width=6, height=4)
+```
+
+# Have the groups had a significant change in their delta over time?
+```{r}
+emm <- emmeans(model, ~ timepoint | group)
+print(emm)
+cat("====================================================\n")
+print(contrast(emm, method = "pairwise", by = "group"))
+```
+The Intervened group has a statistically significant change in the delta, their delta got reduced.
+The Non-Intervened group did not have a statistically significant change in their delta.
+
+# Do the groups start or end with a different delta?
+```{r}
+emm <- emmeans(model, ~ group | timepoint)
+print(emm)
+cat("====================================================\n")
+print(contrast(emm, method = "pairwise", by = "timepoint"))
+```
+At t=0m, the people that got Intervened in the future had a higher delta than the people that did not receive the intervention.
+At t=12m, both groups have a similar mean delta.
+
+
+```{r}
+# =============================================================================
+# 2. ESTIMATED MARGINAL MEANS
+# =============================================================================
+
+# Get estimated marginal means
+emm <- emmeans(model, ~ group * timepoint)
+
+print("=== ESTIMATED MARGINAL MEANS ===")
+print(summary(emm))
+
+# Pairwise comparisons between groups at each timepoint
+print("\n=== PAIRWISE COMPARISONS: Groups within each Timepoint ===")
+pairs_by_time <- pairs(emm, by = "timepoint")
+print(pairs_by_time)
+
+# Pairwise comparisons between timepoints within each group
+print("\n=== PAIRWISE COMPARISONS: Timepoints within each Group ===")
+pairs_by_group <- pairs(emm, by = "group")
+print(pairs_by_group)
+
+# # Test for differences in slopes (change over time)
+# print("\n=== TEST OF SLOPES (Change from baseline to 12m) ===")
+# emm_trends <- emtrends(model, ~ group, var = "timepoint")
+# print(summary(emm_trends))
+# print("\nCompare slopes between groups:")
+# print(pairs(emm_trends))
+# 
+# # Visualize estimated marginal means
+# emmip_plot <- emmip(model, group ~ timepoint, CIs = TRUE) +
+#   theme_minimal() +
+#   labs(title = "Estimated Marginal Means with 95% CI",
+#        x = "Timepoint",
+#        y = "Predicted Delta",
+#        color = "Group") +
+#   theme(legend.position = "bottom")
+# 
+# print(emmip_plot)
+
+# =============================================================================
+# 3. MODEL DIAGNOSTICS
+# =============================================================================
+
+# Set up plotting area for diagnostics
+par(mfrow = c(2, 3))
+
+# Diagnostic 1: Residuals vs Fitted
+plot(fitted(model), residuals(model),
+     xlab = "Fitted Values", ylab = "Residuals",
+     main = "Residuals vs Fitted")
+abline(h = 0, col = "red", lty = 2)
+lowess_line <- lowess(fitted(model), residuals(model))
+lines(lowess_line, col = "blue", lwd = 2)
+
+# Diagnostic 2: Q-Q plot of residuals
+qqnorm(residuals(model), main = "Normal Q-Q Plot: Residuals")
+qqline(residuals(model), col = "red", lwd = 2)
+
+# Diagnostic 3: Scale-Location plot
+plot(fitted(model), sqrt(abs(residuals(model))),
+     xlab = "Fitted Values", ylab = "√|Residuals|",
+     main = "Scale-Location")
+lowess_line <- lowess(fitted(model), sqrt(abs(residuals(model))))
+lines(lowess_line, col = "blue", lwd = 2)
+
+# Diagnostic 4: Random effects Q-Q plot
+random_effects <- ranef(model)$record_id_SVH[[1]]
+qqnorm(random_effects, main = "Normal Q-Q Plot: Random Effects")
+qqline(random_effects, col = "red", lwd = 2)
+
+# Diagnostic 5: Histogram of residuals
+hist(residuals(model), breaks = 30, main = "Histogram of Residuals",
+     xlab = "Residuals", col = "lightblue")
+
+# Diagnostic 6: Residuals by group
+boxplot(residuals(model) ~ deltas_filtered$group,
+        main = "Residuals by Group",
+        xlab = "Group", ylab = "Residuals",
+        col = "lightgreen")
+abline(h = 0, col = "red", lty = 2)
+
+par(mfrow = c(1, 1))  # Reset plotting area
+
+# Statistical tests for assumptions
+print("\n=== NORMALITY TESTS ===")
+print("Shapiro-Wilk test for residuals:")
+shapiro_resid <- shapiro.test(residuals(model))
+print(shapiro_resid)
+
+print("\nShapiro-Wilk test for random effects:")
+shapiro_ranef <- shapiro.test(random_effects)
+print(shapiro_ranef)
+
+# Homogeneity of variance
+print("\n=== HOMOGENEITY OF VARIANCE ===")
+library(car)
+levene_test <- leveneTest(residuals(model) ~ deltas_filtered$group)
+print(levene_test)
+
+# Influential observations
+print("\n=== INFLUENTIAL OBSERVATIONS ===")
+influence_data <- influence(model, obs = TRUE)
+cook_d <- cooks.distance(influence_data)
+influential <- which(cook_d > 4/length(cook_d))
+print(paste("Number of influential observations (Cook's D > 4/n):", length(influential)))
+if(length(influential) > 0) {
+  print("Influential observation indices:")
+  print(influential)
+}
+```
+
+
+
+
+
+
+
